@@ -1,0 +1,20 @@
+# Claude 交互记录
+claude.md
+
+# Videos
+videos/
+*.mp4
+*.avi
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
