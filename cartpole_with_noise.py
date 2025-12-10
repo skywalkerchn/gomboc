@@ -400,6 +400,10 @@ def make_env(
     max_episode_steps: Optional[int] = None,
     enable_exploration_reward: bool = False,
     exploration_weight: float = 0.1,
+    enable_plan_b: bool = False,
+    k_nearest: int = 5,
+    collision_penalty: float = -5.0,
+    distance_weight: float = 0.1,
 ) -> gym.Env:
     """
     Create Gymnasium environment with noise overlay and optional exploration reward.
@@ -411,6 +415,10 @@ def make_env(
         max_episode_steps: Maximum steps per episode (None = use default)
         enable_exploration_reward: Whether to add exploration reward
         exploration_weight: Weight for exploration reward (if enabled)
+        enable_plan_b: Whether to enable Plan B (noise avoidance with features)
+        k_nearest: Number of nearest blocks to include in observation (Plan B)
+        collision_penalty: Penalty for collision with noise blocks (Plan B)
+        distance_weight: Weight for distance reward (Plan B)
 
     Returns:
         Environment wrapped with NoiseOverlayWrapper and optionally ExplorationRewardWrapper
@@ -438,7 +446,40 @@ def make_env(
         noise_field_kwargs = {}
     noise_field = NoiseField(width=width, height=height, **noise_field_kwargs)
 
-    # Wrap environment
+    # Plan B: Add noise features to observation and reward shaping
+    if enable_plan_b:
+        from noise_avoidance.wrappers import (
+            CoordinateConverter,
+            NoiseFeaturesWrapper,
+            NoiseAvoidanceRewardWrapper,
+        )
+
+        # Create coordinate converter
+        converter = CoordinateConverter(
+            frame_width=width,
+            frame_height=height,
+            cart_range=(-2.4, 2.4),
+        )
+
+        # Add noise features to observation
+        env = NoiseFeaturesWrapper(
+            env,
+            noise_field=noise_field,
+            converter=converter,
+            k_nearest=k_nearest,
+        )
+
+        # Add noise avoidance reward
+        env = NoiseAvoidanceRewardWrapper(
+            env,
+            noise_field=noise_field,
+            converter=converter,
+            collision_penalty=collision_penalty,
+            distance_weight=distance_weight,
+            terminate_on_collision=False,
+        )
+
+    # Wrap with noise overlay for rendering
     env = NoiseOverlayWrapper(env, noise_field)
 
     return env
@@ -496,6 +537,10 @@ def train_with_policy(
     max_episode_steps: Optional[int] = None,
     enable_exploration_reward: bool = False,
     exploration_weight: float = 0.1,
+    enable_plan_b: bool = False,
+    k_nearest: int = 5,
+    collision_penalty: float = -5.0,
+    distance_weight: float = 0.1,
 ):
     """
     Train policy on environment with noise blocks.
@@ -512,6 +557,10 @@ def train_with_policy(
         max_episode_steps: Maximum steps per episode (None = use default)
         enable_exploration_reward: Whether to add exploration reward
         exploration_weight: Weight for exploration reward
+        enable_plan_b: Whether to enable Plan B (noise avoidance features)
+        k_nearest: Number of nearest blocks (Plan B)
+        collision_penalty: Collision penalty (Plan B)
+        distance_weight: Distance reward weight (Plan B)
     """
     # Create environment with noise overlay
     env = make_env(
@@ -521,6 +570,10 @@ def train_with_policy(
         max_episode_steps=max_episode_steps,
         enable_exploration_reward=enable_exploration_reward,
         exploration_weight=exploration_weight,
+        enable_plan_b=enable_plan_b,
+        k_nearest=k_nearest,
+        collision_penalty=collision_penalty,
+        distance_weight=distance_weight,
     )
 
     # Create policy
@@ -606,6 +659,10 @@ def record_video_with_policy(
     max_episode_steps: Optional[int] = None,
     enable_exploration_reward: bool = False,
     exploration_weight: float = 0.1,
+    enable_plan_b: bool = False,
+    k_nearest: int = 5,
+    collision_penalty: float = -5.0,
+    distance_weight: float = 0.1,
 ):
     """
     Record video of environment with noise blocks overlay using a trained policy.
@@ -623,6 +680,10 @@ def record_video_with_policy(
         max_episode_steps: Maximum steps per episode (None = use default)
         enable_exploration_reward: Whether to add exploration reward
         exploration_weight: Weight for exploration reward
+        enable_plan_b: Whether to enable Plan B (noise avoidance features)
+        k_nearest: Number of nearest blocks (Plan B)
+        collision_penalty: Collision penalty (Plan B)
+        distance_weight: Distance reward weight (Plan B)
     """
     from gymnasium.wrappers import RecordVideo
 
@@ -637,6 +698,10 @@ def record_video_with_policy(
         max_episode_steps=max_episode_steps,
         enable_exploration_reward=enable_exploration_reward,
         exploration_weight=exploration_weight,
+        enable_plan_b=enable_plan_b,
+        k_nearest=k_nearest,
+        collision_penalty=collision_penalty,
+        distance_weight=distance_weight,
     )
 
     # Wrap with RecordVideo
@@ -719,6 +784,16 @@ def main():
     parser.add_argument("--exploration-weight", type=float, default=0.1,
                         help="Weight for exploration reward (default: 0.1)")
 
+    # Plan B settings (noise avoidance with features)
+    parser.add_argument("--plan-b", action="store_true",
+                        help="Enable Plan B: noise avoidance with low-dim features (obs becomes 19D)")
+    parser.add_argument("--k-nearest", type=int, default=5,
+                        help="Number of nearest noise blocks to track (Plan B)")
+    parser.add_argument("--collision-penalty", type=float, default=-5.0,
+                        help="Penalty for collision with noise blocks (Plan B)")
+    parser.add_argument("--distance-reward-weight", type=float, default=0.1,
+                        help="Weight for distance reward from blocks (Plan B)")
+
     # Output settings
     parser.add_argument("--outdir", type=str, default="videos",
                         help="Output directory for videos (record mode)")
@@ -799,6 +874,12 @@ def main():
             print(f"  Direction: horizontal only")
     if args.enable_exploration_reward:
         print(f"Exploration reward: ENABLED (weight={args.exploration_weight})")
+    if args.plan_b:
+        print(f"Plan B (noise avoidance): ENABLED")
+        print(f"  K nearest blocks: {args.k_nearest}")
+        print(f"  Collision penalty: {args.collision_penalty}")
+        print(f"  Distance reward weight: {args.distance_reward_weight}")
+        print(f"  Observation dimension: 4 + {args.k_nearest}*3 = {4 + args.k_nearest * 3}")
 
     # Run based on mode
     if args.mode == "train":
@@ -814,6 +895,10 @@ def main():
             max_episode_steps=args.max_episode_steps,
             enable_exploration_reward=args.enable_exploration_reward,
             exploration_weight=args.exploration_weight,
+            enable_plan_b=args.plan_b,
+            k_nearest=args.k_nearest,
+            collision_penalty=args.collision_penalty,
+            distance_weight=args.distance_reward_weight,
         )
     elif args.mode == "record":
         record_video_with_policy(
@@ -829,6 +914,10 @@ def main():
             max_episode_steps=args.max_episode_steps,
             enable_exploration_reward=args.enable_exploration_reward,
             exploration_weight=args.exploration_weight,
+            enable_plan_b=args.plan_b,
+            k_nearest=args.k_nearest,
+            collision_penalty=args.collision_penalty,
+            distance_weight=args.distance_reward_weight,
         )
 
 
