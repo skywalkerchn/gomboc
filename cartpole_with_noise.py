@@ -13,6 +13,9 @@ from typing import List, Optional, Tuple
 import gymnasium as gym
 import numpy as np
 
+# Import RL policies
+from policies import RandomPolicy, DQNPolicy, PPOPolicy, A2CPolicy, BasePolicy
+
 
 # ============================================================================
 # Part 1: NoiseBlock data structure
@@ -290,27 +293,165 @@ def make_env(
 
 
 # ============================================================================
-# Part 5: Video recording
+# Part 5: Policy creation
 # ============================================================================
 
-def record_video_with_noise(
+def create_policy(
+    policy_name: str,
+    env: gym.Env,
+    device: str = "cpu",
+    **kwargs,
+) -> BasePolicy:
+    """
+    Create RL policy based on name.
+
+    Args:
+        policy_name: Name of policy ("random", "dqn", "ppo", "a2c")
+        env: Environment
+        device: Device to run on ("cpu" or "cuda")
+        **kwargs: Additional policy-specific arguments
+
+    Returns:
+        Initialized policy
+    """
+    policy_name = policy_name.lower()
+
+    if policy_name == "random":
+        return RandomPolicy(env.observation_space, env.action_space)
+    elif policy_name == "dqn":
+        return DQNPolicy(env.observation_space, env.action_space, device=device, **kwargs)
+    elif policy_name == "ppo":
+        return PPOPolicy(env.observation_space, env.action_space, device=device, **kwargs)
+    elif policy_name == "a2c":
+        return A2CPolicy(env.observation_space, env.action_space, device=device, **kwargs)
+    else:
+        raise ValueError(f"Unknown policy: {policy_name}. Choose from: random, dqn, ppo, a2c")
+
+
+# ============================================================================
+# Part 6: Training with online RL
+# ============================================================================
+
+def train_with_policy(
     env_name: str = "CartPole-v1",
+    policy_name: str = "random",
+    steps: int = 10000,
+    seed: int = 0,
+    noise_field_kwargs: Optional[dict] = None,
+    save_path: Optional[str] = None,
+    log_interval: int = 1000,
+    device: str = "cpu",
+):
+    """
+    Train policy on environment with noise blocks.
+
+    Args:
+        env_name: Name of the Gymnasium environment
+        policy_name: Name of policy to use
+        steps: Number of training steps
+        seed: Random seed
+        noise_field_kwargs: Keyword arguments for NoiseField
+        save_path: Path to save trained policy (if provided)
+        log_interval: Steps between logging
+        device: Device to run on
+    """
+    # Create environment with noise overlay
+    env = make_env(env_name, render_mode="rgb_array", noise_field_kwargs=noise_field_kwargs)
+
+    # Create policy
+    policy = create_policy(policy_name, env, device=device)
+
+    print(f"\nTraining {policy_name.upper()} on {env_name}...")
+    print(f"Total steps: {steps}")
+    print(f"Device: {device}")
+
+    # Training loop
+    obs, info = env.reset(seed=seed)
+    total_reward = 0.0
+    episode_reward = 0.0
+    episode_count = 0
+    episode_steps = 0
+
+    for t in range(steps):
+        # Select action
+        action = policy.select_action(obs, training=True)
+
+        # Take step
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        episode_reward += float(reward)
+        episode_steps += 1
+
+        # Update policy
+        metrics = policy.update(obs, action, reward, next_obs, terminated, truncated)
+
+        # Check if episode ended
+        if terminated or truncated:
+            total_reward += episode_reward
+            episode_count += 1
+
+            if episode_count % 10 == 0:
+                avg_reward = total_reward / episode_count
+                print(f"Episode {episode_count}: reward={episode_reward:.2f}, avg_reward={avg_reward:.2f}, steps={episode_steps}")
+
+            episode_reward = 0.0
+            episode_steps = 0
+            obs, info = env.reset()
+        else:
+            obs = next_obs
+
+        # Log metrics
+        if (t + 1) % log_interval == 0:
+            stats = policy.get_stats()
+            print(f"\nStep {t+1}/{steps}:")
+            print(f"  Episodes: {episode_count}")
+            print(f"  Avg reward: {total_reward / max(1, episode_count):.2f}")
+            for key, value in stats.items():
+                if key != "total_steps":
+                    print(f"  {key}: {value:.4f}")
+
+    env.close()
+
+    # Save policy if requested
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        policy.save(save_path)
+        print(f"\n✓ Policy saved to: {save_path}")
+
+    print(f"\n✓ Training complete!")
+    print(f"  Total episodes: {episode_count}")
+    print(f"  Average reward: {total_reward / max(1, episode_count):.2f}")
+
+    return policy
+
+
+# ============================================================================
+# Part 7: Video recording with policy
+# ============================================================================
+
+def record_video_with_policy(
+    env_name: str = "CartPole-v1",
+    policy_name: str = "random",
     outdir: str = "videos",
     prefix: str = "env_with_noise",
     steps: int = 1000,
     seed: int = 0,
     noise_field_kwargs: Optional[dict] = None,
+    policy_path: Optional[str] = None,
+    device: str = "cpu",
 ):
     """
-    Record video of environment with noise blocks overlay.
+    Record video of environment with noise blocks overlay using a trained policy.
 
     Args:
         env_name: Name of the Gymnasium environment
+        policy_name: Name of policy to use
         outdir: Output directory for videos
         prefix: Prefix for video filename
         steps: Number of steps to run
         seed: Random seed
         noise_field_kwargs: Keyword arguments for NoiseField
+        policy_path: Path to load pre-trained policy (if provided)
+        device: Device to run on
     """
     from gymnasium.wrappers import RecordVideo
 
@@ -323,13 +464,21 @@ def record_video_with_noise(
     # Wrap with RecordVideo
     env = RecordVideo(env, video_folder=outdir, name_prefix=prefix)
 
-    # Run environment with random policy
+    # Create policy
+    policy = create_policy(policy_name, env, device=device)
+
+    # Load pre-trained weights if provided
+    if policy_path:
+        policy.load(policy_path)
+        print(f"Loaded policy from: {policy_path}")
+
+    # Run environment with policy
     obs, info = env.reset(seed=seed)
     total_reward = 0.0
     episode_count = 0
 
     for t in range(steps):
-        action = env.action_space.sample()  # Random policy
+        action = policy.select_action(obs, training=False)
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += float(reward)
 
@@ -342,19 +491,25 @@ def record_video_with_noise(
     print(f"\n✓ Video recording complete!")
     print(f"  Output: {outdir}")
     print(f"  Prefix: {prefix}")
+    print(f"  Policy: {policy_name}")
     print(f"  Steps: {steps}")
     print(f"  Episodes: {episode_count}")
     print(f"  Total reward: {total_reward:.2f}")
+    print(f"  Avg reward per episode: {total_reward / max(1, episode_count):.2f}")
 
 
 # ============================================================================
-# Part 6: Main entry point
+# Part 8: Main entry point
 # ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Record Gymnasium environment with noise blocks overlay"
+        description="Train/record Gymnasium environment with noise blocks and RL policies"
     )
+
+    # Mode selection
+    parser.add_argument("--mode", type=str, default="record", choices=["train", "record"],
+                        help="Mode: 'train' to train policy, 'record' to record video")
 
     # Environment settings
     parser.add_argument("--env", type=str, default="CartPole-v1",
@@ -364,11 +519,25 @@ def main():
     parser.add_argument("--seed", type=int, default=0,
                         help="Random seed")
 
+    # Policy settings
+    parser.add_argument("--policy", type=str, default="random",
+                        choices=["random", "dqn", "ppo", "a2c"],
+                        help="RL policy to use")
+    parser.add_argument("--policy-path", type=str, default=None,
+                        help="Path to load/save policy weights")
+    parser.add_argument("--device", type=str, default="cpu",
+                        choices=["cpu", "cuda"],
+                        help="Device to run on")
+
+    # Training settings
+    parser.add_argument("--log-interval", type=int, default=1000,
+                        help="Steps between logging (training mode)")
+
     # Output settings
     parser.add_argument("--outdir", type=str, default="videos",
-                        help="Output directory for videos")
+                        help="Output directory for videos (record mode)")
     parser.add_argument("--prefix", type=str, default="env_with_noise",
-                        help="Video filename prefix")
+                        help="Video filename prefix (record mode)")
 
     # Noise field parameters
     parser.add_argument("--max-blocks", type=int, default=20,
@@ -419,22 +588,38 @@ def main():
         "ay_global": args.ay,
     }
 
-    # Record video
-    print(f"Recording {args.env} with noise blocks...")
-    print(f"Configuration:")
+    print(f"Environment: {args.env}")
+    print(f"Policy: {args.policy.upper()}")
+    print(f"Noise configuration:")
     print(f"  Max blocks: {args.max_blocks}")
     print(f"  Spawn probability: {args.spawn_prob}")
     print(f"  Static ratio: {args.static_ratio}")
     print(f"  Acceleration: ({args.ax}, {args.ay})")
 
-    record_video_with_noise(
-        env_name=args.env,
-        outdir=args.outdir,
-        prefix=args.prefix,
-        steps=args.steps,
-        seed=args.seed,
-        noise_field_kwargs=noise_field_kwargs,
-    )
+    # Run based on mode
+    if args.mode == "train":
+        train_with_policy(
+            env_name=args.env,
+            policy_name=args.policy,
+            steps=args.steps,
+            seed=args.seed,
+            noise_field_kwargs=noise_field_kwargs,
+            save_path=args.policy_path,
+            log_interval=args.log_interval,
+            device=args.device,
+        )
+    elif args.mode == "record":
+        record_video_with_policy(
+            env_name=args.env,
+            policy_name=args.policy,
+            outdir=args.outdir,
+            prefix=args.prefix,
+            steps=args.steps,
+            seed=args.seed,
+            noise_field_kwargs=noise_field_kwargs,
+            policy_path=args.policy_path,
+            device=args.device,
+        )
 
 
 if __name__ == "__main__":

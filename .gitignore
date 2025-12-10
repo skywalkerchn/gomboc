@@ -1,10 +1,15 @@
-# Claude 交互记录
-claude.md
+# Claude 交互记录（不提交到 git）
+CLAUDE.md
 
 # Videos
 videos/
 *.mp4
 *.avi
+
+# Models
+models/
+*.pt
+*.pth
 
 # Python
 __pycache__/
