@@ -61,6 +61,9 @@ class NoiseField:
         max_lifetime_frames: int = 150,
         ax_global: float = 0.0,
         ay_global: float = 30.0,
+        random_acceleration: bool = True,
+        horizontal_only: bool = False,
+        acc_magnitude_range: Tuple[float, float] = (10.0, 50.0),
     ):
         """
         Args:
@@ -74,8 +77,11 @@ class NoiseField:
             max_block_size: Maximum block size in pixels
             min_lifetime_frames: Minimum block lifetime in frames
             max_lifetime_frames: Maximum block lifetime in frames
-            ax_global: Global acceleration field in x direction
-            ay_global: Global acceleration field in y direction
+            ax_global: Global acceleration field in x direction (used if random_acceleration=False)
+            ay_global: Global acceleration field in y direction (used if random_acceleration=False)
+            random_acceleration: If True, each block gets random acceleration direction
+            horizontal_only: If True, acceleration only in horizontal direction (ay=0)
+            acc_magnitude_range: Range of acceleration magnitude for random accelerations
         """
         self.width = width
         self.height = height
@@ -93,6 +99,9 @@ class NoiseField:
 
         self.ax_global = ax_global
         self.ay_global = ay_global
+        self.random_acceleration = random_acceleration
+        self.horizontal_only = horizontal_only
+        self.acc_magnitude_range = acc_magnitude_range
 
         self.blocks: List[NoiseBlock] = []
 
@@ -113,9 +122,24 @@ class NoiseField:
             vx = np.random.uniform(-50, 50)
             vy = np.random.uniform(-50, 50)
 
-        # Acceleration from global field
-        ax = self.ax_global
-        ay = self.ay_global
+        # Acceleration
+        if self.random_acceleration:
+            # Random acceleration direction with random magnitude
+            acc_magnitude = np.random.uniform(self.acc_magnitude_range[0], self.acc_magnitude_range[1])
+
+            if self.horizontal_only:
+                # Only horizontal acceleration
+                ax = np.random.choice([-1, 1]) * acc_magnitude
+                ay = 0.0
+            else:
+                # Random direction in 2D
+                angle = np.random.uniform(0, 2 * np.pi)
+                ax = acc_magnitude * np.cos(angle)
+                ay = acc_magnitude * np.sin(angle)
+        else:
+            # Use global acceleration field
+            ax = self.ax_global
+            ay = self.ay_global
 
         # Random color
         color = np.random.randint(0, 256, size=3, dtype=np.uint8)
@@ -717,9 +741,17 @@ def main():
     parser.add_argument("--max-lifetime", type=int, default=150,
                         help="Maximum block lifetime in frames")
     parser.add_argument("--ax", type=float, default=0.0,
-                        help="Global acceleration in x direction")
+                        help="Global acceleration in x direction (used when --no-random-acceleration)")
     parser.add_argument("--ay", type=float, default=30.0,
-                        help="Global acceleration in y direction")
+                        help="Global acceleration in y direction (used when --no-random-acceleration)")
+    parser.add_argument("--no-random-acceleration", action="store_true",
+                        help="Use global acceleration field instead of random per-block accelerations")
+    parser.add_argument("--horizontal-only", action="store_true",
+                        help="Restrict accelerations to horizontal direction only (no vertical component)")
+    parser.add_argument("--acc-min", type=float, default=10.0,
+                        help="Minimum acceleration magnitude for random accelerations")
+    parser.add_argument("--acc-max", type=float, default=50.0,
+                        help="Maximum acceleration magnitude for random accelerations")
     parser.add_argument("--fps", type=float, default=30.0,
                         help="Frames per second (for physics)")
 
@@ -748,6 +780,9 @@ def main():
         "max_lifetime_frames": args.max_lifetime,
         "ax_global": args.ax,
         "ay_global": args.ay,
+        "random_acceleration": not args.no_random_acceleration,
+        "horizontal_only": args.horizontal_only,
+        "acc_magnitude_range": (args.acc_min, args.acc_max),
     }
 
     print(f"Environment: {args.env}")
@@ -756,7 +791,12 @@ def main():
     print(f"  Max blocks: {args.max_blocks}")
     print(f"  Spawn probability: {args.spawn_prob}")
     print(f"  Static ratio: {args.static_ratio}")
-    print(f"  Acceleration: ({args.ax}, {args.ay})")
+    if args.no_random_acceleration:
+        print(f"  Acceleration: ({args.ax}, {args.ay}) [global field]")
+    else:
+        print(f"  Acceleration: random, magnitude={args.acc_min}-{args.acc_max}")
+        if args.horizontal_only:
+            print(f"  Direction: horizontal only")
     if args.enable_exploration_reward:
         print(f"Exploration reward: ENABLED (weight={args.exploration_weight})")
 
