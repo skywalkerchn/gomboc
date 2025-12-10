@@ -255,6 +255,7 @@ def make_env(
     env_name: str = "CartPole-v1",
     render_mode: str = "rgb_array",
     noise_field_kwargs: Optional[dict] = None,
+    max_episode_steps: Optional[int] = None,
 ) -> gym.Env:
     """
     Create Gymnasium environment with noise overlay.
@@ -263,11 +264,12 @@ def make_env(
         env_name: Name of the Gymnasium environment
         render_mode: Render mode (should be "rgb_array" for video recording)
         noise_field_kwargs: Keyword arguments for NoiseField initialization
+        max_episode_steps: Maximum steps per episode (None = use default)
 
     Returns:
         Environment wrapped with NoiseOverlayWrapper
     """
-    env = gym.make(env_name, render_mode=render_mode)
+    env = gym.make(env_name, render_mode=render_mode, max_episode_steps=max_episode_steps)
 
     # Get frame dimensions from environment
     # For CartPole and most envs, we can render once to get shape
@@ -341,6 +343,7 @@ def train_with_policy(
     save_path: Optional[str] = None,
     log_interval: int = 1000,
     device: str = "cpu",
+    max_episode_steps: Optional[int] = None,
 ):
     """
     Train policy on environment with noise blocks.
@@ -354,9 +357,10 @@ def train_with_policy(
         save_path: Path to save trained policy (if provided)
         log_interval: Steps between logging
         device: Device to run on
+        max_episode_steps: Maximum steps per episode (None = use default)
     """
     # Create environment with noise overlay
-    env = make_env(env_name, render_mode="rgb_array", noise_field_kwargs=noise_field_kwargs)
+    env = make_env(env_name, render_mode="rgb_array", noise_field_kwargs=noise_field_kwargs, max_episode_steps=max_episode_steps)
 
     # Create policy
     policy = create_policy(policy_name, env, device=device)
@@ -438,6 +442,7 @@ def record_video_with_policy(
     noise_field_kwargs: Optional[dict] = None,
     policy_path: Optional[str] = None,
     device: str = "cpu",
+    max_episode_steps: Optional[int] = None,
 ):
     """
     Record video of environment with noise blocks overlay using a trained policy.
@@ -452,6 +457,7 @@ def record_video_with_policy(
         noise_field_kwargs: Keyword arguments for NoiseField
         policy_path: Path to load pre-trained policy (if provided)
         device: Device to run on
+        max_episode_steps: Maximum steps per episode (None = use default)
     """
     from gymnasium.wrappers import RecordVideo
 
@@ -459,7 +465,7 @@ def record_video_with_policy(
     Path(outdir).mkdir(parents=True, exist_ok=True)
 
     # Create environment with noise overlay
-    env = make_env(env_name, render_mode="rgb_array", noise_field_kwargs=noise_field_kwargs)
+    env = make_env(env_name, render_mode="rgb_array", noise_field_kwargs=noise_field_kwargs, max_episode_steps=max_episode_steps)
 
     # Wrap with RecordVideo
     env = RecordVideo(env, video_folder=outdir, name_prefix=prefix)
@@ -518,6 +524,8 @@ def main():
                         help="Number of steps to run")
     parser.add_argument("--seed", type=int, default=0,
                         help="Random seed")
+    parser.add_argument("--max-episode-steps", type=int, default=None,
+                        help="Maximum steps per episode (None = use environment default)")
 
     # Policy settings
     parser.add_argument("--policy", type=str, default="random",
@@ -607,6 +615,7 @@ def main():
             save_path=args.policy_path,
             log_interval=args.log_interval,
             device=args.device,
+            max_episode_steps=args.max_episode_steps,
         )
     elif args.mode == "record":
         record_video_with_policy(
@@ -619,6 +628,7 @@ def main():
             noise_field_kwargs=noise_field_kwargs,
             policy_path=args.policy_path,
             device=args.device,
+            max_episode_steps=args.max_episode_steps,
         )
 
 
