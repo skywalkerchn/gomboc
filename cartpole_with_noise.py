@@ -188,7 +188,7 @@ class NoiseField:
                 frame[y0:y1, x0:x1, :] = block.color
 
                 # Draw acceleration arrow if block has non-zero acceleration
-                if not block.is_static and (block.ax != 0 or block.ay != 0):
+                if block.ax != 0 or block.ay != 0:
                     # Calculate arrow properties
                     center_x = int(block.x)
                     center_y = int(block.y)
