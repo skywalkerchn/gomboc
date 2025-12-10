@@ -167,7 +167,9 @@ class NoiseField:
             self.blocks.append(new_block)
 
     def _draw_blocks(self, frame: np.ndarray) -> np.ndarray:
-        """Draw all blocks onto the frame."""
+        """Draw all blocks onto the frame with acceleration arrows."""
+        import cv2
+
         for block in self.blocks:
             # Calculate block bounding box
             x0 = int(round(block.x - block.size / 2))
@@ -184,6 +186,33 @@ class NoiseField:
             # Draw block
             if x1 > x0 and y1 > y0:
                 frame[y0:y1, x0:x1, :] = block.color
+
+                # Draw acceleration arrow if block has non-zero acceleration
+                if not block.is_static and (block.ax != 0 or block.ay != 0):
+                    # Calculate arrow properties
+                    center_x = int(block.x)
+                    center_y = int(block.y)
+
+                    # Scale arrow length based on acceleration magnitude
+                    acc_magnitude = np.sqrt(block.ax**2 + block.ay**2)
+                    arrow_scale = min(block.size * 0.8 / max(1.0, acc_magnitude), block.size * 0.4)
+
+                    end_x = int(center_x + block.ax * arrow_scale)
+                    end_y = int(center_y + block.ay * arrow_scale)
+
+                    # Choose contrasting color for arrow (white or black)
+                    avg_color = np.mean(block.color)
+                    arrow_color = (255, 255, 255) if avg_color < 128 else (0, 0, 0)
+
+                    # Draw arrow
+                    cv2.arrowedLine(
+                        frame,
+                        (center_x, center_y),
+                        (end_x, end_y),
+                        arrow_color,
+                        thickness=2,
+                        tipLength=0.3
+                    )
 
         return frame
 
@@ -204,8 +233,97 @@ class NoiseField:
 
 
 # ============================================================================
-# Part 3: NoiseOverlayWrapper - Gymnasium wrapper
+# Part 3: Reward wrappers and NoiseOverlayWrapper
 # ============================================================================
+
+class ExplorationRewardWrapper(gym.Wrapper):
+    """
+    Wrapper that adds exploration reward to encourage the agent to move around.
+    Tracks cart position and rewards visiting new areas.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        exploration_weight: float = 0.1,
+        position_bins: int = 50,
+        position_range: tuple = (-2.4, 2.4),
+    ):
+        """
+        Args:
+            env: Base environment
+            exploration_weight: Weight for exploration reward component
+            position_bins: Number of bins to discretize position space
+            position_range: Range of cart position (min, max)
+        """
+        super().__init__(env)
+        self.exploration_weight = exploration_weight
+        self.position_bins = position_bins
+        self.position_range = position_range
+
+        # Track visited positions
+        self.visited_bins = set()
+        self.position_history = []
+
+        # Calculate bin width
+        self.bin_width = (position_range[1] - position_range[0]) / position_bins
+
+    def _get_position_bin(self, position: float) -> int:
+        """Convert continuous position to discrete bin index."""
+        normalized = (position - self.position_range[0]) / (self.position_range[1] - self.position_range[0])
+        bin_idx = int(normalized * self.position_bins)
+        return max(0, min(self.position_bins - 1, bin_idx))
+
+    def _calculate_exploration_reward(self, obs: np.ndarray) -> float:
+        """
+        Calculate exploration reward based on:
+        1. Visiting new positions (novelty)
+        2. Position variance (encouraging movement)
+        """
+        # Extract cart position (first element in CartPole observation)
+        cart_position = float(obs[0])
+        self.position_history.append(cart_position)
+
+        # Novelty reward: bonus for visiting new bins
+        current_bin = self._get_position_bin(cart_position)
+        novelty_reward = 0.0
+        if current_bin not in self.visited_bins:
+            self.visited_bins.add(current_bin)
+            novelty_reward = 1.0
+
+        # Movement reward: encourage position variance
+        if len(self.position_history) >= 10:
+            recent_positions = self.position_history[-10:]
+            position_variance = np.var(recent_positions)
+            movement_reward = np.clip(position_variance * 5.0, 0.0, 1.0)
+        else:
+            movement_reward = 0.0
+
+        # Combine rewards
+        exploration_reward = (novelty_reward + movement_reward) * self.exploration_weight
+        return exploration_reward
+
+    def reset(self, **kwargs):
+        """Reset environment and exploration tracking."""
+        self.visited_bins = set()
+        self.position_history = []
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        """Step environment and add exploration reward."""
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        # Add exploration reward
+        exploration_reward = self._calculate_exploration_reward(obs)
+        modified_reward = reward + exploration_reward
+
+        # Store reward components in info
+        info['original_reward'] = reward
+        info['exploration_reward'] = exploration_reward
+        info['total_reward'] = modified_reward
+
+        return obs, modified_reward, terminated, truncated, info
+
 
 class NoiseOverlayWrapper(gym.Wrapper):
     """
@@ -244,7 +362,7 @@ def ensure_headless_display(width: int = 1280, height: int = 720):
         from pyvirtualdisplay import Display
         display = Display(visible=False, size=(width, height))
         display.start()
-        print(f"✓ Virtual display started: {width}x{height}")
+        print(f"[OK] Virtual display started: {width}x{height}")
     except ImportError:
         warnings.warn("pyvirtualdisplay not available. Skipping virtual display setup.")
     except Exception as e:
@@ -256,20 +374,28 @@ def make_env(
     render_mode: str = "rgb_array",
     noise_field_kwargs: Optional[dict] = None,
     max_episode_steps: Optional[int] = None,
+    enable_exploration_reward: bool = False,
+    exploration_weight: float = 0.1,
 ) -> gym.Env:
     """
-    Create Gymnasium environment with noise overlay.
+    Create Gymnasium environment with noise overlay and optional exploration reward.
 
     Args:
         env_name: Name of the Gymnasium environment
         render_mode: Render mode (should be "rgb_array" for video recording)
         noise_field_kwargs: Keyword arguments for NoiseField initialization
         max_episode_steps: Maximum steps per episode (None = use default)
+        enable_exploration_reward: Whether to add exploration reward
+        exploration_weight: Weight for exploration reward (if enabled)
 
     Returns:
-        Environment wrapped with NoiseOverlayWrapper
+        Environment wrapped with NoiseOverlayWrapper and optionally ExplorationRewardWrapper
     """
     env = gym.make(env_name, render_mode=render_mode, max_episode_steps=max_episode_steps)
+
+    # Add exploration reward wrapper first (before noise overlay)
+    if enable_exploration_reward:
+        env = ExplorationRewardWrapper(env, exploration_weight=exploration_weight)
 
     # Get frame dimensions from environment
     # For CartPole and most envs, we can render once to get shape
@@ -344,6 +470,8 @@ def train_with_policy(
     log_interval: int = 1000,
     device: str = "cpu",
     max_episode_steps: Optional[int] = None,
+    enable_exploration_reward: bool = False,
+    exploration_weight: float = 0.1,
 ):
     """
     Train policy on environment with noise blocks.
@@ -358,9 +486,18 @@ def train_with_policy(
         log_interval: Steps between logging
         device: Device to run on
         max_episode_steps: Maximum steps per episode (None = use default)
+        enable_exploration_reward: Whether to add exploration reward
+        exploration_weight: Weight for exploration reward
     """
     # Create environment with noise overlay
-    env = make_env(env_name, render_mode="rgb_array", noise_field_kwargs=noise_field_kwargs, max_episode_steps=max_episode_steps)
+    env = make_env(
+        env_name,
+        render_mode="rgb_array",
+        noise_field_kwargs=noise_field_kwargs,
+        max_episode_steps=max_episode_steps,
+        enable_exploration_reward=enable_exploration_reward,
+        exploration_weight=exploration_weight,
+    )
 
     # Create policy
     policy = create_policy(policy_name, env, device=device)
@@ -419,9 +556,9 @@ def train_with_policy(
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         policy.save(save_path)
-        print(f"\n✓ Policy saved to: {save_path}")
+        print(f"\n[OK] Policy saved to: {save_path}")
 
-    print(f"\n✓ Training complete!")
+    print(f"\n[OK] Training complete!")
     print(f"  Total episodes: {episode_count}")
     print(f"  Average reward: {total_reward / max(1, episode_count):.2f}")
 
@@ -443,6 +580,8 @@ def record_video_with_policy(
     policy_path: Optional[str] = None,
     device: str = "cpu",
     max_episode_steps: Optional[int] = None,
+    enable_exploration_reward: bool = False,
+    exploration_weight: float = 0.1,
 ):
     """
     Record video of environment with noise blocks overlay using a trained policy.
@@ -458,6 +597,8 @@ def record_video_with_policy(
         policy_path: Path to load pre-trained policy (if provided)
         device: Device to run on
         max_episode_steps: Maximum steps per episode (None = use default)
+        enable_exploration_reward: Whether to add exploration reward
+        exploration_weight: Weight for exploration reward
     """
     from gymnasium.wrappers import RecordVideo
 
@@ -465,7 +606,14 @@ def record_video_with_policy(
     Path(outdir).mkdir(parents=True, exist_ok=True)
 
     # Create environment with noise overlay
-    env = make_env(env_name, render_mode="rgb_array", noise_field_kwargs=noise_field_kwargs, max_episode_steps=max_episode_steps)
+    env = make_env(
+        env_name,
+        render_mode="rgb_array",
+        noise_field_kwargs=noise_field_kwargs,
+        max_episode_steps=max_episode_steps,
+        enable_exploration_reward=enable_exploration_reward,
+        exploration_weight=exploration_weight,
+    )
 
     # Wrap with RecordVideo
     env = RecordVideo(env, video_folder=outdir, name_prefix=prefix)
@@ -494,7 +642,7 @@ def record_video_with_policy(
 
     env.close()
 
-    print(f"\n✓ Video recording complete!")
+    print(f"\n[OK] Video recording complete!")
     print(f"  Output: {outdir}")
     print(f"  Prefix: {prefix}")
     print(f"  Policy: {policy_name}")
@@ -540,6 +688,12 @@ def main():
     # Training settings
     parser.add_argument("--log-interval", type=int, default=1000,
                         help="Steps between logging (training mode)")
+
+    # Reward settings
+    parser.add_argument("--enable-exploration-reward", action="store_true",
+                        help="Enable exploration reward to encourage movement")
+    parser.add_argument("--exploration-weight", type=float, default=0.1,
+                        help="Weight for exploration reward (default: 0.1)")
 
     # Output settings
     parser.add_argument("--outdir", type=str, default="videos",
@@ -603,6 +757,8 @@ def main():
     print(f"  Spawn probability: {args.spawn_prob}")
     print(f"  Static ratio: {args.static_ratio}")
     print(f"  Acceleration: ({args.ax}, {args.ay})")
+    if args.enable_exploration_reward:
+        print(f"Exploration reward: ENABLED (weight={args.exploration_weight})")
 
     # Run based on mode
     if args.mode == "train":
@@ -616,6 +772,8 @@ def main():
             log_interval=args.log_interval,
             device=args.device,
             max_episode_steps=args.max_episode_steps,
+            enable_exploration_reward=args.enable_exploration_reward,
+            exploration_weight=args.exploration_weight,
         )
     elif args.mode == "record":
         record_video_with_policy(
@@ -629,6 +787,8 @@ def main():
             policy_path=args.policy_path,
             device=args.device,
             max_episode_steps=args.max_episode_steps,
+            enable_exploration_reward=args.enable_exploration_reward,
+            exploration_weight=args.exploration_weight,
         )
 
 
