@@ -190,6 +190,15 @@ class NoiseField:
             new_block = self._spawn_random_block()
             self.blocks.append(new_block)
 
+    def tick(self):
+        """
+        Advance noise simulation by one environment step/frame:
+        - update existing blocks (age/physics/out-of-bounds)
+        - possibly spawn new blocks
+        """
+        self._update_blocks()
+        self._spawn_new_blocks()
+
     def _draw_blocks(self, frame: np.ndarray) -> np.ndarray:
         """Draw all blocks onto the frame with acceleration arrows."""
         import cv2
@@ -250,8 +259,7 @@ class NoiseField:
         Returns:
             Modified frame with noise blocks drawn on top
         """
-        self._update_blocks()
-        self._spawn_new_blocks()
+        self.tick()
         frame = self._draw_blocks(frame)
         return frame
 
@@ -368,9 +376,24 @@ class NoiseOverlayWrapper(gym.Wrapper):
         frame = self.env.render()
         if frame is None:
             return None
-        # Add noise blocks on top of the frame
-        frame = self.noise_field.update_and_draw(frame)
+        # Only draw. Noise simulation is advanced in step() via NoiseFieldStepWrapper.
+        frame = self.noise_field._draw_blocks(frame)
         return frame
+
+
+class NoiseFieldStepWrapper(gym.Wrapper):
+    """
+    Advance NoiseField on every env.step(), so noise exists during training even without rendering.
+    """
+
+    def __init__(self, env: gym.Env, noise_field: NoiseField):
+        super().__init__(env)
+        self.noise_field = noise_field
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self.noise_field.tick()
+        return obs, reward, terminated, truncated, info
 
 
 # ============================================================================
@@ -401,9 +424,12 @@ def make_env(
     enable_exploration_reward: bool = False,
     exploration_weight: float = 0.1,
     enable_plan_b: bool = False,
+    enable_plan_b_reward: bool = True,
     k_nearest: int = 5,
     collision_penalty: float = -5.0,
     distance_weight: float = 0.1,
+    enable_force_field: bool = False,
+    field_strength: float = 1.0,
 ) -> gym.Env:
     """
     Create Gymnasium environment with noise overlay and optional exploration reward.
@@ -429,14 +455,22 @@ def make_env(
     if enable_exploration_reward:
         env = ExplorationRewardWrapper(env, exploration_weight=exploration_weight)
 
-    # Get frame dimensions from environment
-    # For CartPole and most envs, we can render once to get shape
-    frame = env.reset()[0]  # Reset returns (obs, info)
-    env.render()  # Force render to initialize
-    test_frame = env.render()
-    if test_frame is not None:
-        height, width = test_frame.shape[:2]
-    else:
+    # Get frame dimensions from environment.
+    # IMPORTANT: rendering classic-control envs may require pygame; avoid hard dependency for training.
+    env.reset()  # Reset returns (obs, info)
+
+    width = getattr(env.unwrapped, "screen_width", None)
+    height = getattr(env.unwrapped, "screen_height", None)
+
+    if width is None or height is None:
+        try:
+            test_frame = env.render()
+            if test_frame is not None:
+                height, width = test_frame.shape[:2]
+        except Exception as e:
+            warnings.warn(f"Render unavailable for frame size detection ({e}). Falling back to defaults.")
+
+    if width is None or height is None:
         # Fallback dimensions
         width, height = 640, 480
         warnings.warn(f"Could not determine frame size, using default {width}x{height}")
@@ -446,12 +480,16 @@ def make_env(
         noise_field_kwargs = {}
     noise_field = NoiseField(width=width, height=height, **noise_field_kwargs)
 
+    # Advance noise on every step (so it exists during training even without render calls)
+    env = NoiseFieldStepWrapper(env, noise_field)
+
     # Plan B: Add noise features to observation and reward shaping
     if enable_plan_b:
         from noise_avoidance.wrappers import (
             CoordinateConverter,
             NoiseFeaturesWrapper,
             NoiseAvoidanceRewardWrapper,
+            NoiseForceFieldWrapper,
         )
 
         # Create coordinate converter
@@ -469,15 +507,25 @@ def make_env(
             k_nearest=k_nearest,
         )
 
-        # Add noise avoidance reward
-        env = NoiseAvoidanceRewardWrapper(
-            env,
-            noise_field=noise_field,
-            converter=converter,
-            collision_penalty=collision_penalty,
-            distance_weight=distance_weight,
-            terminate_on_collision=False,
-        )
+        # Optional: make blocks physically affect the cart (external horizontal acceleration/force field)
+        if enable_force_field:
+            env = NoiseForceFieldWrapper(
+                env,
+                noise_field=noise_field,
+                converter=converter,
+                strength=field_strength,
+            )
+
+        # Add noise avoidance reward (optional)
+        if enable_plan_b_reward:
+            env = NoiseAvoidanceRewardWrapper(
+                env,
+                noise_field=noise_field,
+                converter=converter,
+                collision_penalty=collision_penalty,
+                distance_weight=distance_weight,
+                terminate_on_collision=False,
+            )
 
     # Wrap with noise overlay for rendering
     env = NoiseOverlayWrapper(env, noise_field)
@@ -538,9 +586,12 @@ def train_with_policy(
     enable_exploration_reward: bool = False,
     exploration_weight: float = 0.1,
     enable_plan_b: bool = False,
+    enable_plan_b_reward: bool = True,
     k_nearest: int = 5,
     collision_penalty: float = -5.0,
     distance_weight: float = 0.1,
+    enable_force_field: bool = False,
+    field_strength: float = 1.0,
 ):
     """
     Train policy on environment with noise blocks.
@@ -571,9 +622,12 @@ def train_with_policy(
         enable_exploration_reward=enable_exploration_reward,
         exploration_weight=exploration_weight,
         enable_plan_b=enable_plan_b,
+        enable_plan_b_reward=enable_plan_b_reward,
         k_nearest=k_nearest,
         collision_penalty=collision_penalty,
         distance_weight=distance_weight,
+        enable_force_field=enable_force_field,
+        field_strength=field_strength,
     )
 
     # Create policy
@@ -607,7 +661,7 @@ def train_with_policy(
             total_reward += episode_reward
             episode_count += 1
 
-            if episode_count % 10 == 0:
+            if episode_count % 300 == 0:
                 avg_reward = total_reward / episode_count
                 print(f"Episode {episode_count}: reward={episode_reward:.2f}, avg_reward={avg_reward:.2f}, steps={episode_steps}")
 
@@ -660,9 +714,15 @@ def record_video_with_policy(
     enable_exploration_reward: bool = False,
     exploration_weight: float = 0.1,
     enable_plan_b: bool = False,
+    enable_plan_b_reward: bool = True,
     k_nearest: int = 5,
     collision_penalty: float = -5.0,
     distance_weight: float = 0.1,
+    enable_force_field: bool = False,
+    field_strength: float = 1.0,
+    record_only_first_episode: bool = False,
+    record_every_n_episodes: int = 1,
+    video_length: int = 0,
 ):
     """
     Record video of environment with noise blocks overlay using a trained policy.
@@ -699,13 +759,28 @@ def record_video_with_policy(
         enable_exploration_reward=enable_exploration_reward,
         exploration_weight=exploration_weight,
         enable_plan_b=enable_plan_b,
+        enable_plan_b_reward=enable_plan_b_reward,
         k_nearest=k_nearest,
         collision_penalty=collision_penalty,
         distance_weight=distance_weight,
+        enable_force_field=enable_force_field,
+        field_strength=field_strength,
     )
 
     # Wrap with RecordVideo
-    env = RecordVideo(env, video_folder=outdir, name_prefix=prefix)
+    if record_only_first_episode:
+        episode_trigger = lambda ep: ep == 0  # noqa: E731
+    else:
+        n = max(1, int(record_every_n_episodes))
+        episode_trigger = (lambda ep, n=n: (ep % n) == 0)  # noqa: E731
+
+    env = RecordVideo(
+        env,
+        video_folder=outdir,
+        name_prefix=prefix,
+        episode_trigger=episode_trigger,
+        video_length=max(0, int(video_length)),
+    )
 
     # Create policy
     policy = create_policy(policy_name, env, device=device)
@@ -775,7 +850,7 @@ def main():
                         help="Device to run on")
 
     # Training settings
-    parser.add_argument("--log-interval", type=int, default=1000,
+    parser.add_argument("--log-interval", type=int, default=10000,
                         help="Steps between logging (training mode)")
 
     # Reward settings
@@ -787,6 +862,8 @@ def main():
     # Plan B settings (noise avoidance with features)
     parser.add_argument("--plan-b", action="store_true",
                         help="Enable Plan B: noise avoidance with low-dim features (obs becomes 19D)")
+    parser.add_argument("--no-plan-b-reward", action="store_true",
+                        help="Plan B features only: disable collision/distance reward shaping (no 'collision' concept)")
     parser.add_argument("--k-nearest", type=int, default=5,
                         help="Number of nearest noise blocks to track (Plan B)")
     parser.add_argument("--collision-penalty", type=float, default=-5.0,
@@ -794,11 +871,23 @@ def main():
     parser.add_argument("--distance-reward-weight", type=float, default=0.1,
                         help="Weight for distance reward from blocks (Plan B)")
 
+    # Physical force-field settings (optional, works with --plan-b)
+    parser.add_argument("--force-field", action="store_true",
+                        help="Enable force field: noise blocks apply horizontal acceleration to the cart when nearby")
+    parser.add_argument("--field-strength", type=float, default=1.0,
+                        help="Overall strength multiplier for block acceleration applied to the cart")
+
     # Output settings
     parser.add_argument("--outdir", type=str, default="videos",
                         help="Output directory for videos (record mode)")
     parser.add_argument("--prefix", type=str, default="env_with_noise",
                         help="Video filename prefix (record mode)")
+    parser.add_argument("--record-only-first-episode", action="store_true",
+                        help="Record only the first episode (record mode)")
+    parser.add_argument("--record-every-n-episodes", type=int, default=1,
+                        help="Record every N episodes (record mode). Ignored if --record-only-first-episode is set")
+    parser.add_argument("--video-length", type=int, default=0,
+                        help="Fixed video length in steps (0 = full episode) (record mode)")
 
     # Noise field parameters
     parser.add_argument("--max-blocks", type=int, default=20,
@@ -877,9 +966,14 @@ def main():
     if args.plan_b:
         print(f"Plan B (noise avoidance): ENABLED")
         print(f"  K nearest blocks: {args.k_nearest}")
-        print(f"  Collision penalty: {args.collision_penalty}")
-        print(f"  Distance reward weight: {args.distance_reward_weight}")
+        if args.no_plan_b_reward:
+            print(f"  Plan B reward: DISABLED (features only)")
+        else:
+            print(f"  Collision penalty: {args.collision_penalty}")
+            print(f"  Distance reward weight: {args.distance_reward_weight}")
         print(f"  Observation dimension: 4 + {args.k_nearest}*3 = {4 + args.k_nearest * 3}")
+        if args.force_field:
+            print(f"  Force field: ENABLED (radius = block size, strength={args.field_strength})")
 
     # Run based on mode
     if args.mode == "train":
@@ -896,9 +990,12 @@ def main():
             enable_exploration_reward=args.enable_exploration_reward,
             exploration_weight=args.exploration_weight,
             enable_plan_b=args.plan_b,
+            enable_plan_b_reward=(args.plan_b and (not args.no_plan_b_reward)),
             k_nearest=args.k_nearest,
             collision_penalty=args.collision_penalty,
             distance_weight=args.distance_reward_weight,
+            enable_force_field=args.force_field,
+            field_strength=args.field_strength,
         )
     elif args.mode == "record":
         record_video_with_policy(
@@ -915,9 +1012,15 @@ def main():
             enable_exploration_reward=args.enable_exploration_reward,
             exploration_weight=args.exploration_weight,
             enable_plan_b=args.plan_b,
+            enable_plan_b_reward=(args.plan_b and (not args.no_plan_b_reward)),
             k_nearest=args.k_nearest,
             collision_penalty=args.collision_penalty,
             distance_weight=args.distance_reward_weight,
+            enable_force_field=args.force_field,
+            field_strength=args.field_strength,
+            record_only_first_episode=args.record_only_first_episode,
+            record_every_n_episodes=args.record_every_n_episodes,
+            video_length=args.video_length,
         )
 
 

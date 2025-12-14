@@ -15,7 +15,7 @@ import gymnasium as gym
 
 # Import noise components
 sys.path.insert(0, '.')
-from cartpole_with_noise import NoiseField, NoiseOverlayWrapper
+from cartpole_with_noise import NoiseField, NoiseOverlayWrapper, NoiseFieldStepWrapper
 from noise_avoidance.wrappers import (
     CoordinateConverter,
     NoiseFeaturesWrapper,
@@ -46,13 +46,10 @@ def create_env_plan_b(
     # Base environment
     env = gym.make("CartPole-v1", render_mode=render_mode)
 
-    # Get frame dimensions
+    # Get frame dimensions without requiring pygame render()
     env.reset()
-    test_frame = env.render()
-    if test_frame is not None:
-        frame_height, frame_width = test_frame.shape[:2]
-    else:
-        frame_width, frame_height = 600, 400
+    frame_width = getattr(env.unwrapped, "screen_width", 600)
+    frame_height = getattr(env.unwrapped, "screen_height", 400)
 
     print(f"Frame size: {frame_width}x{frame_height}")
 
@@ -75,6 +72,7 @@ def create_env_plan_b(
     )
 
     # Wrap with noise features
+    env = NoiseFieldStepWrapper(env, noise_field)
     env = NoiseFeaturesWrapper(
         env,
         noise_field=noise_field,

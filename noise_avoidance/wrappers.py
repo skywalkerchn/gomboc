@@ -481,3 +481,87 @@ class NoiseAvoidanceRewardWrapper(gym.RewardWrapper):
         self.total_steps = 0
 
         return obs, info
+
+
+class NoiseForceFieldWrapper(gym.Wrapper):
+    """
+    Apply an external horizontal acceleration to the CartPole cart based on nearby noise blocks.
+
+    Concept:
+    - Each noise block carries an "acceleration vector" (block.ax, block.ay) in pixel units.
+    - We interpret block.ax as a source of horizontal acceleration field.
+    - When the cart is within a configurable radius of a block (in x), it receives extra acceleration.
+
+    Notes:
+    - This modifies both the returned observation (x_dot) and env.unwrapped.state[1] to stay consistent.
+    - It is CartPole-specific (assumes state = [x, x_dot, theta, theta_dot]).
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        noise_field,
+        converter: CoordinateConverter,
+        strength: float = 1.0,
+        max_abs_acc: float = 50.0,
+    ):
+        super().__init__(env)
+        self.noise_field = noise_field
+        self.converter = converter
+        self.strength = float(strength)
+        self.max_abs_acc = float(max_abs_acc)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        # CartPole state (Gymnasium classic-control): [x, x_dot, theta, theta_dot]
+        state = getattr(self.env.unwrapped, "state", None)
+        if state is None or len(state) < 2:
+            return obs, reward, terminated, truncated, info
+
+        cart_x = float(state[0])
+
+        # Convert pixel acceleration to CartPole units (same scale as positions).
+        scale = self.converter.cart_range_total / self.converter.frame_width  # cart_unit per pixel
+
+        tau = float(getattr(self.env.unwrapped, "tau", 0.02))
+
+        extra_acc = 0.0
+        for block in getattr(self.noise_field, "blocks", []):
+            # Block x in cart units
+            block_x = self.converter.pixel_to_cart_x(block.x)
+
+            # Influence radius in cart units: exactly block half-width (matches visual size)
+            block_half_width = self.converter.pixel_to_cart_size(block.size / 2)
+            radius = max(1e-6, block_half_width)
+
+            dist = abs(cart_x - block_x)
+            if dist >= radius:
+                continue
+
+            # Linear falloff weight: 1 at center, 0 at boundary
+            w = 1.0 - (dist / radius)
+
+            block_acc_cart = float(block.ax) * scale
+            extra_acc += w * block_acc_cart
+
+        extra_acc = float(np.clip(extra_acc * self.strength, -self.max_abs_acc, self.max_abs_acc))
+
+        if abs(extra_acc) > 1e-12:
+            # Update x_dot in both observation and internal state for consistency
+            try:
+                obs = np.array(obs, dtype=np.float32, copy=True)
+                obs[1] = float(obs[1]) + extra_acc * tau
+            except Exception:
+                pass
+
+            try:
+                self.env.unwrapped.state[1] = float(self.env.unwrapped.state[1]) + extra_acc * tau
+            except Exception:
+                pass
+
+        info = dict(info)
+        info["noise_forcefield_extra_acc_x"] = extra_acc
+        info["noise_forcefield_strength"] = self.strength
+
+        return obs, reward, terminated, truncated, info
