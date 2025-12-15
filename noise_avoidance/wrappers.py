@@ -503,13 +503,17 @@ class NoiseForceFieldWrapper(gym.Wrapper):
         noise_field,
         converter: CoordinateConverter,
         strength: float = 1.0,
+        pole_strength: float = 0.0,
         max_abs_acc: float = 50.0,
+        max_abs_pole_acc: float = 50.0,
     ):
         super().__init__(env)
         self.noise_field = noise_field
         self.converter = converter
         self.strength = float(strength)
+        self.pole_strength = float(pole_strength)
         self.max_abs_acc = float(max_abs_acc)
+        self.max_abs_pole_acc = float(max_abs_pole_acc)
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
@@ -520,6 +524,8 @@ class NoiseForceFieldWrapper(gym.Wrapper):
             return obs, reward, terminated, truncated, info
 
         cart_x = float(state[0])
+        cart_x_pixel = float(self.converter.cart_to_pixel_x(cart_x))
+        cart_y_pixel = float(self.converter.cart_y_pixel)
 
         # Convert pixel acceleration to CartPole units (same scale as positions).
         scale = self.converter.cart_range_total / self.converter.frame_width  # cart_unit per pixel
@@ -527,41 +533,204 @@ class NoiseForceFieldWrapper(gym.Wrapper):
         tau = float(getattr(self.env.unwrapped, "tau", 0.02))
 
         extra_acc = 0.0
+        extra_pole_acc = 0.0
+        hits = 0
         for block in getattr(self.noise_field, "blocks", []):
-            # Block x in cart units
-            block_x = self.converter.pixel_to_cart_x(block.x)
-
-            # Influence radius in cart units: exactly block half-width (matches visual size)
-            block_half_width = self.converter.pixel_to_cart_size(block.size / 2)
-            radius = max(1e-6, block_half_width)
-
-            dist = abs(cart_x - block_x)
-            if dist >= radius:
+            # Strict in-square check in pixel space (matches the visual square exactly)
+            half = float(block.size) / 2.0
+            if abs(cart_x_pixel - float(block.x)) > half:
+                continue
+            if abs(cart_y_pixel - float(block.y)) > half:
                 continue
 
-            # Linear falloff weight: 1 at center, 0 at boundary
-            w = 1.0 - (dist / radius)
-
+            # Inside the square => apply full field (no falloff)
             block_acc_cart = float(block.ax) * scale
-            extra_acc += w * block_acc_cart
+            extra_acc += block_acc_cart
+            # Optionally also perturb pole angular velocity (torque-like disturbance).
+            # Use the same field sign/magnitude by default; scale separately.
+            extra_pole_acc += block_acc_cart
+            hits += 1
 
         extra_acc = float(np.clip(extra_acc * self.strength, -self.max_abs_acc, self.max_abs_acc))
+        extra_pole_acc = float(
+            np.clip(extra_pole_acc * self.pole_strength, -self.max_abs_pole_acc, self.max_abs_pole_acc)
+        )
 
-        if abs(extra_acc) > 1e-12:
-            # Update x_dot in both observation and internal state for consistency
+        if abs(extra_acc) > 1e-12 or abs(extra_pole_acc) > 1e-12:
+            # Update x_dot / theta_dot in both observation and internal state for consistency
             try:
                 obs = np.array(obs, dtype=np.float32, copy=True)
                 obs[1] = float(obs[1]) + extra_acc * tau
+                if obs.shape[0] >= 4:
+                    obs[3] = float(obs[3]) + extra_pole_acc * tau
             except Exception:
                 pass
 
             try:
                 self.env.unwrapped.state[1] = float(self.env.unwrapped.state[1]) + extra_acc * tau
+                if len(self.env.unwrapped.state) >= 4:
+                    self.env.unwrapped.state[3] = float(self.env.unwrapped.state[3]) + extra_pole_acc * tau
             except Exception:
                 pass
 
         info = dict(info)
         info["noise_forcefield_extra_acc_x"] = extra_acc
+        info["noise_forcefield_extra_acc_theta"] = extra_pole_acc
         info["noise_forcefield_strength"] = self.strength
+        info["noise_forcefield_pole_strength"] = self.pole_strength
+        info["noise_forcefield_hits"] = hits
 
+        return obs, reward, terminated, truncated, info
+
+
+class CartPoleNoiseForceFieldDynamicsWrapper(gym.Wrapper):
+    """
+    CartPole-specific force-field wrapper that applies the noise field *inside the true dynamics*.
+
+    Why this exists:
+    - Modifying observation/state AFTER env.step() does NOT affect the physics integration of that step.
+    - Here we implement the CartPole equations of motion directly (same as classic control),
+      adding external force / external pole angular acceleration BEFORE integration.
+
+    Field activation (strict square in pixel space):
+    - The cart "effective point" is (cart_x_pixel, cart_y_pixel).
+    - A block is active iff that point lies inside its square [x±size/2, y±size/2].
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        noise_field,
+        converter: CoordinateConverter,
+        cart_strength: float = 1.0,
+        pole_strength: float = 0.0,
+        max_abs_cart_acc: float = 50.0,
+        max_abs_pole_acc: float = 50.0,
+        max_episode_steps: Optional[int] = None,
+    ):
+        super().__init__(env)
+        self.noise_field = noise_field
+        self.converter = converter
+        self.cart_strength = float(cart_strength)
+        self.pole_strength = float(pole_strength)
+        self.max_abs_cart_acc = float(max_abs_cart_acc)
+        self.max_abs_pole_acc = float(max_abs_pole_acc)
+        self.max_episode_steps = max_episode_steps
+        self._elapsed_steps = 0
+
+    def reset(self, **kwargs):
+        self._elapsed_steps = 0
+        return self.env.reset(**kwargs)
+
+    def _field_hits_and_acc(self, cart_x: float) -> tuple[float, float, int]:
+        cart_x_pixel = float(self.converter.cart_to_pixel_x(cart_x))
+        cart_y_pixel = float(self.converter.cart_y_pixel)
+
+        # pixel -> cart units
+        scale = self.converter.cart_range_total / self.converter.frame_width
+
+        cart_acc = 0.0
+        pole_acc = 0.0
+        hits = 0
+        for block in getattr(self.noise_field, "blocks", []):
+            half = float(block.size) / 2.0
+            if abs(cart_x_pixel - float(block.x)) > half:
+                continue
+            if abs(cart_y_pixel - float(block.y)) > half:
+                continue
+
+            block_acc_cart = float(block.ax) * scale
+            cart_acc += block_acc_cart
+            pole_acc += block_acc_cart
+            hits += 1
+
+        cart_acc = float(np.clip(cart_acc * self.cart_strength, -self.max_abs_cart_acc, self.max_abs_cart_acc))
+        pole_acc = float(np.clip(pole_acc * self.pole_strength, -self.max_abs_pole_acc, self.max_abs_pole_acc))
+        return cart_acc, pole_acc, hits
+
+    def step(self, action):
+        unwrapped = self.env.unwrapped
+
+        # Must be CartPole-like
+        state = getattr(unwrapped, "state", None)
+        if state is None or len(state) != 4:
+            # Fallback: at least tick noise and delegate
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            self.noise_field.tick()
+            info = dict(info)
+            info["noise_forcefield_note"] = "fallback_delegated_step"
+            return obs, reward, terminated, truncated, info
+
+        x, x_dot, theta, theta_dot = map(float, state)
+
+        # Compute field accelerations based on current effective point BEFORE integration
+        extra_cart_acc, extra_pole_acc, hits = self._field_hits_and_acc(x)
+
+        # Base action force (CartPole is discrete left/right)
+        force_mag = float(getattr(unwrapped, "force_mag", 10.0))
+        force = force_mag if int(action) == 1 else -force_mag
+
+        # Convert extra "cart acceleration" into an equivalent force term on the cart mass.
+        # F = m * a
+        masscart = float(getattr(unwrapped, "masscart", 1.0))
+        extra_force = masscart * extra_cart_acc
+        total_force = force + extra_force
+
+        gravity = float(getattr(unwrapped, "gravity", 9.8))
+        masspole = float(getattr(unwrapped, "masspole", 0.1))
+        total_mass = float(getattr(unwrapped, "total_mass", masspole + masscart))
+        length = float(getattr(unwrapped, "length", 0.5))  # actually half the pole's length
+        polemass_length = float(getattr(unwrapped, "polemass_length", masspole * length))
+        tau = float(getattr(unwrapped, "tau", 0.02))
+
+        costheta = float(np.cos(theta))
+        sintheta = float(np.sin(theta))
+
+        temp = (total_force + polemass_length * theta_dot * theta_dot * sintheta) / total_mass
+        thetaacc = (gravity * sintheta - costheta * temp) / (
+            length * (4.0 / 3.0 - masspole * costheta * costheta / total_mass)
+        )
+        xacc = temp - polemass_length * thetaacc * costheta / total_mass
+
+        # Add pole disturbance as an extra angular acceleration term
+        thetaacc = thetaacc + extra_pole_acc
+
+        # Integrate
+        x = x + tau * x_dot
+        x_dot = x_dot + tau * xacc
+        theta = theta + tau * theta_dot
+        theta_dot = theta_dot + tau * thetaacc
+
+        unwrapped.state = np.array([x, x_dot, theta, theta_dot], dtype=np.float32)
+
+        # Termination
+        x_threshold = float(getattr(unwrapped, "x_threshold", 2.4))
+        theta_threshold_radians = float(getattr(unwrapped, "theta_threshold_radians", 12 * 2 * np.pi / 360))
+        terminated = bool(
+            x < -x_threshold
+            or x > x_threshold
+            or theta < -theta_threshold_radians
+            or theta > theta_threshold_radians
+        )
+
+        # Truncation (time limit) - to avoid relying on TimeLimit wrapper we may have bypassed
+        self._elapsed_steps += 1
+        truncated = False
+        if self.max_episode_steps is not None and self._elapsed_steps >= int(self.max_episode_steps):
+            truncated = True
+
+        # Reward (classic CartPole)
+        reward = 1.0
+
+        # Tick noise once per step (advance patches for next step)
+        self.noise_field.tick()
+
+        obs = np.array(unwrapped.state, dtype=np.float32)
+        info = {
+            "noise_forcefield_hits": hits,
+            "noise_forcefield_extra_acc_x": extra_cart_acc,
+            "noise_forcefield_extra_acc_theta": extra_pole_acc,
+            "noise_forcefield_cart_strength": self.cart_strength,
+            "noise_forcefield_pole_strength": self.pole_strength,
+        }
         return obs, reward, terminated, truncated, info

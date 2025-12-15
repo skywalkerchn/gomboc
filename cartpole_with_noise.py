@@ -8,6 +8,9 @@ import argparse
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
+import time
+from uuid import uuid4
 from typing import List, Optional, Tuple
 
 import gymnasium as gym
@@ -23,7 +26,14 @@ from policies import RandomPolicy, DQNPolicy, PPOPolicy, A2CPolicy, BasePolicy
 
 @dataclass
 class NoiseBlock:
-    """Represents a single noise block with position, velocity, acceleration, and lifetime."""
+    """
+    Represents a single noise block (a *field patch*) with position, velocity, field vector, and lifetime.
+
+    Important semantics:
+    - (ax, ay) represent the **field vector** carried by this patch (used for visualization + optional force-field).
+    - The patch itself moves with (vx, vy). We intentionally do NOT use (ax, ay) to accelerate the patch,
+      otherwise it looks like "the block is accelerating" rather than "the block is a noise/force field region".
+    """
     x: float  # Current center x coordinate (pixels)
     y: float  # Current center y coordinate (pixels)
     vx: float  # Velocity in x direction
@@ -64,6 +74,8 @@ class NoiseField:
         random_acceleration: bool = True,
         horizontal_only: bool = False,
         acc_magnitude_range: Tuple[float, float] = (10.0, 50.0),
+        spawn_y_center: Optional[float] = None,
+        spawn_y_half_range: Optional[float] = None,
     ):
         """
         Args:
@@ -82,6 +94,8 @@ class NoiseField:
             random_acceleration: If True, each block gets random acceleration direction
             horizontal_only: If True, acceleration only in horizontal direction (ay=0)
             acc_magnitude_range: Range of acceleration magnitude for random accelerations
+            spawn_y_center: If set (pixels), spawn blocks around this y center instead of anywhere on screen
+            spawn_y_half_range: Half range (pixels). If set with spawn_y_center, spawn y ~ Uniform[center-half, center+half]
         """
         self.width = width
         self.height = height
@@ -103,6 +117,9 @@ class NoiseField:
         self.horizontal_only = horizontal_only
         self.acc_magnitude_range = acc_magnitude_range
 
+        self.spawn_y_center = spawn_y_center
+        self.spawn_y_half_range = spawn_y_half_range
+
         self.blocks: List[NoiseBlock] = []
 
     def _spawn_random_block(self) -> NoiseBlock:
@@ -112,7 +129,25 @@ class NoiseField:
 
         # Random position (ensure block stays within frame)
         x = np.random.uniform(size / 2, self.width - size / 2)
-        y = np.random.uniform(size / 2, self.height - size / 2)
+        y_low = size / 2
+        y_high = self.height - size / 2
+        if (
+            self.spawn_y_center is not None
+            and self.spawn_y_half_range is not None
+            and self.spawn_y_half_range >= 0
+        ):
+            band_low = float(self.spawn_y_center) - float(self.spawn_y_half_range)
+            band_high = float(self.spawn_y_center) + float(self.spawn_y_half_range)
+            # Clamp band to valid range for this size
+            y0 = max(y_low, band_low)
+            y1 = min(y_high, band_high)
+            if y1 > y0:
+                y = np.random.uniform(y0, y1)
+            else:
+                # Band too narrow for this block size -> fall back to full range
+                y = np.random.uniform(y_low, y_high)
+        else:
+            y = np.random.uniform(y_low, y_high)
 
         # Initial velocity
         if is_static:
@@ -166,11 +201,7 @@ class NoiseField:
 
             # Update position and velocity for dynamic blocks
             if not block.is_static:
-                # Update velocity
-                block.vx += block.ax * self.dt
-                block.vy += block.ay * self.dt
-
-                # Update position
+                # Update position (patch drifts with its own velocity; field vector (ax, ay) is NOT used here)
                 block.x += block.vx * self.dt
                 block.y += block.vy * self.dt
 
@@ -200,9 +231,10 @@ class NoiseField:
         self._spawn_new_blocks()
 
     def _draw_blocks(self, frame: np.ndarray) -> np.ndarray:
-        """Draw all blocks onto the frame with acceleration arrows."""
+        """Draw all blocks onto the frame with field-direction arrows."""
         import cv2
 
+        # Pass 1: draw all block squares (so later blocks don't overwrite arrows)
         for block in self.blocks:
             # Calculate block bounding box
             x0 = int(round(block.x - block.size / 2))
@@ -220,32 +252,44 @@ class NoiseField:
             if x1 > x0 and y1 > y0:
                 frame[y0:y1, x0:x1, :] = block.color
 
-                # Draw acceleration arrow if block has non-zero acceleration
-                if block.ax != 0 or block.ay != 0:
-                    # Calculate arrow properties
-                    center_x = int(block.x)
-                    center_y = int(block.y)
+        # Pass 2: draw all field arrows on top (so they're always visible)
+        for block in self.blocks:
+            if block.ax == 0 and block.ay == 0:
+                continue
 
-                    # Scale arrow length based on acceleration magnitude
-                    acc_magnitude = np.sqrt(block.ax**2 + block.ay**2)
-                    arrow_scale = min(block.size * 0.8 / max(1.0, acc_magnitude), block.size * 0.4)
+            center_x = int(round(block.x))
+            center_y = int(round(block.y))
 
-                    end_x = int(center_x + block.ax * arrow_scale)
-                    end_y = int(center_y + block.ay * arrow_scale)
+            # Keep arrow endpoints reasonable and visible:
+            # length increases with field magnitude (not inverse), and can extend beyond the block.
+            ax = float(block.ax)
+            ay = float(block.ay)
+            acc_magnitude = float(np.sqrt(ax * ax + ay * ay))
+            if acc_magnitude < 1e-8:
+                continue
 
-                    # Choose contrasting color for arrow (white or black)
-                    avg_color = np.mean(block.color)
-                    arrow_color = (255, 255, 255) if avg_color < 128 else (0, 0, 0)
+            dir_x = ax / acc_magnitude
+            dir_y = ay / acc_magnitude
 
-                    # Draw arrow
-                    cv2.arrowedLine(
-                        frame,
-                        (center_x, center_y),
-                        (end_x, end_y),
-                        arrow_color,
-                        thickness=2,
-                        tipLength=0.3
-                    )
+            min_len = 10.0
+            max_len = max(20.0, float(block.size) * 1.5)
+            arrow_len = float(np.clip(acc_magnitude * 0.6, min_len, max_len))
+
+            end_x = int(round(center_x + dir_x * arrow_len))
+            end_y = int(round(center_y + dir_y * arrow_len))
+
+            # Choose contrasting color for arrow (white or black)
+            avg_color = float(np.mean(block.color))
+            arrow_color = (255, 255, 255) if avg_color < 128 else (0, 0, 0)
+
+            cv2.arrowedLine(
+                frame,
+                (center_x, center_y),
+                (end_x, end_y),
+                arrow_color,
+                thickness=2,
+                tipLength=0.3,
+            )
 
         return frame
 
@@ -362,22 +406,50 @@ class NoiseOverlayWrapper(gym.Wrapper):
     Gymnasium wrapper that overlays noise blocks on top of rendered frames.
     """
 
-    def __init__(self, env: gym.Env, noise_field: NoiseField):
+    def __init__(
+        self,
+        env: gym.Env,
+        noise_field: NoiseField,
+        converter=None,
+        show_cart_marker: bool = True,
+        cart_marker_radius: int = 4,
+    ):
         """
         Args:
             env: Base Gymnasium environment
             noise_field: NoiseField instance to manage noise blocks
+            converter: Optional CoordinateConverter (for CartPole marker)
+            show_cart_marker: Whether to draw a marker for cart position
+            cart_marker_radius: Radius (pixels) for cart marker
         """
         super().__init__(env)
         self.noise_field = noise_field
+        self.converter = converter
+        self.show_cart_marker = show_cart_marker
+        self.cart_marker_radius = cart_marker_radius
 
     def render(self):
         """Override render to add noise overlay."""
         frame = self.env.render()
         if frame is None:
             return None
-        # Only draw. Noise simulation is advanced in step() via NoiseFieldStepWrapper.
+        # Only draw. Noise simulation is advanced in step() wrappers.
         frame = self.noise_field._draw_blocks(frame)
+
+        # Optional: draw cart marker (blue dot) at the cart's current x position.
+        if self.show_cart_marker and self.converter is not None:
+            try:
+                import cv2
+
+                state = getattr(self.env.unwrapped, "state", None)
+                if state is not None and len(state) >= 1:
+                    cart_x = float(state[0])
+                    cart_x_px = int(round(float(self.converter.cart_to_pixel_x(cart_x))))
+                    cart_y_px = int(round(float(self.converter.cart_y_pixel)))
+                    # Blue in OpenCV BGR
+                    cv2.circle(frame, (cart_x_px, cart_y_px), int(self.cart_marker_radius), (255, 0, 0), -1)
+            except Exception:
+                pass
         return frame
 
 
@@ -430,6 +502,8 @@ def make_env(
     distance_weight: float = 0.1,
     enable_force_field: bool = False,
     field_strength: float = 1.0,
+    field_pole_strength: float = 0.0,
+    show_cart_marker: bool = True,
 ) -> gym.Env:
     """
     Create Gymnasium environment with noise overlay and optional exploration reward.
@@ -475,28 +549,51 @@ def make_env(
         width, height = 640, 480
         warnings.warn(f"Could not determine frame size, using default {width}x{height}")
 
-    # Create noise field
-    if noise_field_kwargs is None:
-        noise_field_kwargs = {}
-    noise_field = NoiseField(width=width, height=height, **noise_field_kwargs)
+    # Coordinate converter is useful for Plan B features, the force-field, and cart marker.
+    converter = None
+    if enable_plan_b or enable_force_field or env_name.lower().startswith("cartpole"):
+        from noise_avoidance.wrappers import CoordinateConverter
 
-    # Advance noise on every step (so it exists during training even without render calls)
-    env = NoiseFieldStepWrapper(env, noise_field)
-
-    # Plan B: Add noise features to observation and reward shaping
-    if enable_plan_b:
-        from noise_avoidance.wrappers import (
-            CoordinateConverter,
-            NoiseFeaturesWrapper,
-            NoiseAvoidanceRewardWrapper,
-            NoiseForceFieldWrapper,
-        )
-
-        # Create coordinate converter
         converter = CoordinateConverter(
             frame_width=width,
             frame_height=height,
             cart_range=(-2.4, 2.4),
+        )
+
+    # Create noise field
+    if noise_field_kwargs is None:
+        noise_field_kwargs = {}
+    # If using strict x+y in-square force-field, default to spawning blocks near the cart's y line (±2 pixels)
+    if enable_force_field:
+        noise_field_kwargs = dict(noise_field_kwargs)
+        noise_field_kwargs.setdefault("spawn_y_center", float(converter.cart_y_pixel) if converter is not None else None)
+        noise_field_kwargs.setdefault("spawn_y_half_range", 2.0)
+
+    noise_field = NoiseField(width=width, height=height, **noise_field_kwargs)
+
+    # Advance noise on every step (so it exists during training even without render calls).
+    # If we install a CartPole dynamics wrapper that ticks noise itself, we must avoid double-tick.
+    if enable_force_field and env_name.lower().startswith("cartpole"):
+        # Apply field *inside* CartPole dynamics (pre-integration). Must happen BEFORE ObservationWrappers
+        # like NoiseFeaturesWrapper, otherwise we'd return 4D obs and bypass the 19D feature augmentation.
+        from noise_avoidance.wrappers import CartPoleNoiseForceFieldDynamicsWrapper
+
+        env = CartPoleNoiseForceFieldDynamicsWrapper(
+            env,
+            noise_field=noise_field,
+            converter=converter,
+            cart_strength=field_strength,
+            pole_strength=field_pole_strength,
+            max_episode_steps=max_episode_steps,
+        )
+    else:
+        env = NoiseFieldStepWrapper(env, noise_field)
+
+    # Plan B: Add noise features to observation and reward shaping
+    if enable_plan_b:
+        from noise_avoidance.wrappers import (
+            NoiseFeaturesWrapper,
+            NoiseAvoidanceRewardWrapper,
         )
 
         # Add noise features to observation
@@ -506,15 +603,6 @@ def make_env(
             converter=converter,
             k_nearest=k_nearest,
         )
-
-        # Optional: make blocks physically affect the cart (external horizontal acceleration/force field)
-        if enable_force_field:
-            env = NoiseForceFieldWrapper(
-                env,
-                noise_field=noise_field,
-                converter=converter,
-                strength=field_strength,
-            )
 
         # Add noise avoidance reward (optional)
         if enable_plan_b_reward:
@@ -528,7 +616,7 @@ def make_env(
             )
 
     # Wrap with noise overlay for rendering
-    env = NoiseOverlayWrapper(env, noise_field)
+    env = NoiseOverlayWrapper(env, noise_field, converter=converter, show_cart_marker=show_cart_marker)
 
     return env
 
@@ -592,6 +680,8 @@ def train_with_policy(
     distance_weight: float = 0.1,
     enable_force_field: bool = False,
     field_strength: float = 1.0,
+    field_pole_strength: float = 0.0,
+    show_cart_marker: bool = True,
 ):
     """
     Train policy on environment with noise blocks.
@@ -628,6 +718,8 @@ def train_with_policy(
         distance_weight=distance_weight,
         enable_force_field=enable_force_field,
         field_strength=field_strength,
+        field_pole_strength=field_pole_strength,
+        show_cart_marker=show_cart_marker,
     )
 
     # Create policy
@@ -720,9 +812,12 @@ def record_video_with_policy(
     distance_weight: float = 0.1,
     enable_force_field: bool = False,
     field_strength: float = 1.0,
+    field_pole_strength: float = 0.0,
     record_only_first_episode: bool = False,
     record_every_n_episodes: int = 1,
     video_length: int = 0,
+    record_episodes: int = 0,
+    min_episode_reward_to_save: float = 0.0,
 ):
     """
     Record video of environment with noise blocks overlay using a trained policy.
@@ -748,7 +843,17 @@ def record_video_with_policy(
     from gymnasium.wrappers import RecordVideo
 
     # Create output directory
-    Path(outdir).mkdir(parents=True, exist_ok=True)
+    outdir_path = Path(outdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+
+    # If we want to conditionally keep videos based on episode reward, record into a temp folder
+    # and only move kept episodes into outdir. This avoids issues with overwriting same filenames
+    # (set-diff snapshots can't detect overwrites).
+    use_temp_video_dir = float(min_episode_reward_to_save) > 0.0
+    temp_video_dir = outdir_path / f".tmp_recordings_{uuid4().hex}"
+    video_folder = temp_video_dir if use_temp_video_dir else outdir_path
+    if use_temp_video_dir:
+        temp_video_dir.mkdir(parents=True, exist_ok=True)
 
     # Create environment with noise overlay
     env = make_env(
@@ -765,6 +870,8 @@ def record_video_with_policy(
         distance_weight=distance_weight,
         enable_force_field=enable_force_field,
         field_strength=field_strength,
+        field_pole_strength=field_pole_strength,
+        show_cart_marker=True,
     )
 
     # Wrap with RecordVideo
@@ -776,7 +883,7 @@ def record_video_with_policy(
 
     env = RecordVideo(
         env,
-        video_folder=outdir,
+        video_folder=str(video_folder),
         name_prefix=prefix,
         episode_trigger=episode_trigger,
         video_length=max(0, int(video_length)),
@@ -790,21 +897,100 @@ def record_video_with_policy(
         policy.load(policy_path)
         print(f"Loaded policy from: {policy_path}")
 
+    def _try_unlink(p: Path, retries: int = 10, delay_s: float = 0.05):
+        for _ in range(retries):
+            try:
+                p.unlink(missing_ok=True)
+                return True
+            except Exception:
+                time.sleep(delay_s)
+        return False
+
+    def _try_move(src: Path, dst: Path, retries: int = 10, delay_s: float = 0.05):
+        for _ in range(retries):
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if dst.exists():
+                    _try_unlink(dst)
+                shutil.move(str(src), str(dst))
+                return True
+            except Exception:
+                time.sleep(delay_s)
+        return False
+
     # Run environment with policy
     obs, info = env.reset(seed=seed)
     total_reward = 0.0
     episode_count = 0
+    episode_reward = 0.0
+
+    # Track newly created video files per episode so we can conditionally delete/move them.
+    def _snapshot_video_files() -> set:
+        try:
+            return set(video_folder.glob(f"{prefix}-episode-*.*"))
+        except Exception:
+            return set()
+
+    prev_files = _snapshot_video_files()
 
     for t in range(steps):
         action = policy.select_action(obs, training=False)
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += float(reward)
+        episode_reward += float(reward)
 
         if terminated or truncated:
+            # IMPORTANT: Gymnasium's RecordVideo typically finalizes/writes the episode video on reset().
+            # Snapshot BEFORE reset, then reset (flush), then snapshot AFTER reset to get the files produced
+            # by the just-finished episode.
+            files_before_reset = _snapshot_video_files()
+
             obs, info = env.reset()
+
+            files_after_reset = _snapshot_video_files()
+            new_files = files_after_reset - files_before_reset
+
+            if use_temp_video_dir:
+                keep = episode_reward >= float(min_episode_reward_to_save)
+                moved = 0
+                deleted = 0
+
+                if keep:
+                    for p in new_files:
+                        target = outdir_path / p.name
+                        if _try_move(p, target):
+                            moved += 1
+                else:
+                    for p in new_files:
+                        if _try_unlink(p):
+                            deleted += 1
+
+                print(
+                    f"[record] episode_end reward={episode_reward:.2f} "
+                    f"new_files={len(new_files)} action={'KEEP' if keep else 'DROP'} "
+                    f"moved={moved} deleted={deleted}"
+                )
+            else:
+                if float(min_episode_reward_to_save) > 0.0 and episode_reward < float(min_episode_reward_to_save):
+                    for p in new_files:
+                        _try_unlink(p)
             episode_count += 1
+            episode_reward = 0.0
+            prev_files = _snapshot_video_files()
+            if int(record_episodes) > 0 and episode_count >= int(record_episodes):
+                break
 
     env.close()
+
+    # Best-effort cleanup of temp folder if used and now empty
+    if use_temp_video_dir:
+        try:
+            # Do NOT delete remaining files here; that can destroy kept episodes if moves failed.
+            # Only remove the temp dir if it's already empty.
+            if not any(temp_video_dir.iterdir()):
+                temp_video_dir.rmdir()
+        except Exception:
+            pass
 
     print(f"\n[OK] Video recording complete!")
     print(f"  Output: {outdir}")
@@ -876,6 +1062,8 @@ def main():
                         help="Enable force field: noise blocks apply horizontal acceleration to the cart when nearby")
     parser.add_argument("--field-strength", type=float, default=1.0,
                         help="Overall strength multiplier for block acceleration applied to the cart")
+    parser.add_argument("--field-pole-strength", type=float, default=0.0,
+                        help="Additional strength multiplier applied to pole angular velocity disturbance (0 = disabled)")
 
     # Output settings
     parser.add_argument("--outdir", type=str, default="videos",
@@ -888,12 +1076,20 @@ def main():
                         help="Record every N episodes (record mode). Ignored if --record-only-first-episode is set")
     parser.add_argument("--video-length", type=int, default=0,
                         help="Fixed video length in steps (0 = full episode) (record mode)")
+    parser.add_argument("--record-episodes", type=int, default=0,
+                        help="Stop recording after N episodes (0 = no limit, controlled by --steps) (record mode)")
+    parser.add_argument("--min-episode-reward-to-save", type=float, default=0.0,
+                        help="If > 0, discard (delete) recorded episode videos whose total episode reward is below this threshold")
+    parser.add_argument("--no-cart-marker", action="store_true",
+                        help="Disable drawing blue dot marker for cart x position on rendered frames")
 
     # Noise field parameters
     parser.add_argument("--max-blocks", type=int, default=20,
                         help="Maximum number of noise blocks")
     parser.add_argument("--spawn-prob", type=float, default=0.05,
                         help="Probability of spawning a block each frame")
+    parser.add_argument("--spawn-y-band-half", type=float, default=None,
+                        help="If set, spawn blocks only near the cart y-line: y in [cart_y - band, cart_y + band] (pixels). Example: 2.0")
     parser.add_argument("--static-ratio", type=float, default=0.3,
                         help="Ratio of static blocks (0.0-1.0)")
     parser.add_argument("--min-block-size", type=int, default=10,
@@ -948,6 +1144,9 @@ def main():
         "horizontal_only": args.horizontal_only,
         "acc_magnitude_range": (args.acc_min, args.acc_max),
     }
+    if args.spawn_y_band_half is not None:
+        # Center will be filled in make_env() from cart_y_pixel; we only pass the half-range here.
+        noise_field_kwargs["spawn_y_half_range"] = float(args.spawn_y_band_half)
 
     print(f"Environment: {args.env}")
     print(f"Policy: {args.policy.upper()}")
@@ -973,7 +1172,7 @@ def main():
             print(f"  Distance reward weight: {args.distance_reward_weight}")
         print(f"  Observation dimension: 4 + {args.k_nearest}*3 = {4 + args.k_nearest * 3}")
         if args.force_field:
-            print(f"  Force field: ENABLED (radius = block size, strength={args.field_strength})")
+            print(f"  Force field: ENABLED (radius = block size, cart_strength={args.field_strength}, pole_strength={args.field_pole_strength})")
 
     # Run based on mode
     if args.mode == "train":
@@ -996,6 +1195,8 @@ def main():
             distance_weight=args.distance_reward_weight,
             enable_force_field=args.force_field,
             field_strength=args.field_strength,
+            field_pole_strength=args.field_pole_strength,
+            show_cart_marker=(not args.no_cart_marker),
         )
     elif args.mode == "record":
         record_video_with_policy(
@@ -1018,9 +1219,13 @@ def main():
             distance_weight=args.distance_reward_weight,
             enable_force_field=args.force_field,
             field_strength=args.field_strength,
+            field_pole_strength=args.field_pole_strength,
             record_only_first_episode=args.record_only_first_episode,
             record_every_n_episodes=args.record_every_n_episodes,
             video_length=args.video_length,
+            record_episodes=args.record_episodes,
+            min_episode_reward_to_save=args.min_episode_reward_to_save,
+            # marker is part of env creation
         )
 
 
