@@ -4,7 +4,7 @@ Gymnasium environment video recorder with physics-based noise blocks overlay.
 
 ## Demo
 
-https://github.com/skywalkerchn/gomboc/raw/cartpole_noiseblock/demo_ppo.mp4
+![Demo Video](demo_ppo.mp4)
 
 *PPO agent trained on CartPole with dynamic noise field blocks. The agent learns to balance the pole while navigating through randomly spawning noise blocks with physics-based force fields.*
 
