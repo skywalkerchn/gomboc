@@ -2,13 +2,22 @@
 
 Gymnasium environment video recorder with physics-based noise blocks overlay.
 
+## Demo
+
+https://github.com/user-attachments/assets/demo_ppo.mp4
+
+*PPO agent trained on CartPole with dynamic noise field blocks. The agent learns to balance the pole while navigating through randomly spawning noise blocks with physics-based force fields.*
+
 ## Features
 
-- Record videos of any Gymnasium environment (CartPole, MuJoCo, MetaWorld, etc.)
-- Overlay dynamic noise blocks with physics simulation
-- Support for both static and dynamic noise blocks
-- Configurable acceleration field
-- Fully customizable via command-line arguments
+- **Multiple RL Policies**: Support for DQN, PPO, A2C, and Random policies
+- **Dynamic Noise Blocks**: Physics-based noise blocks with customizable acceleration fields
+- **Force Field System**: Noise blocks can physically affect CartPole dynamics (cart position and pole angular velocity)
+- **Noise Avoidance (Plan B)**: Low-dimensional features for noise proximity detection and avoidance reward shaping
+- **Advanced Video Recording**: Conditional episode saving based on reward thresholds, flexible recording strategies
+- **Visualization**: Real-time cart position markers and force field direction arrows
+- **Customizable Spawning**: Control noise block spawn zones (e.g., near cart y-coordinate)
+- **Training & Recording Modes**: Train policies or record videos with trained models
 
 ## Installation
 
@@ -26,24 +35,34 @@ python cartpole_with_noise.py --steps 1000
 
 ## Usage Examples
 
-### Basic recording
+### Train a DQN policy with noise blocks
 ```bash
-python cartpole_with_noise.py --env CartPole-v1 --steps 1000
+python cartpole_with_noise.py --mode train --policy dqn --steps 10000 --policy-path models/dqn.pt
 ```
 
-### More noise blocks with stronger gravity
+### Train with Plan B (noise avoidance features)
 ```bash
-python cartpole_with_noise.py --max-blocks 50 --ay 100 --spawn-prob 0.1
+python cartpole_with_noise.py --mode train --policy dqn --steps 5000 --plan-b --policy-path models/dqn_planb.pt --max-blocks 15 --spawn-prob 0.15
 ```
 
-### Static blocks only (no physics)
+### Train with force field enabled
 ```bash
-python cartpole_with_noise.py --static-ratio 1.0 --ax 0 --ay 0
+python cartpole_with_noise.py --mode train --policy ppo --steps 10000 --plan-b --force-field --field-strength 1.0 --field-pole-strength 0.5 --policy-path models/ppo_forcefield.pt
 ```
 
-### Use with other environments
+### Record video with trained policy
 ```bash
-python cartpole_with_noise.py --env Pendulum-v1 --steps 500
+python cartpole_with_noise.py --mode record --policy dqn --policy-path models/dqn_planb.pt --steps 500 --plan-b --max-blocks 15 --spawn-prob 0.15 --prefix "dqn_planb"
+```
+
+### Record only high-quality episodes (reward > 400)
+```bash
+python cartpole_with_noise.py --mode record --policy ppo --policy-path models/ppo.pt --record-episodes 20 --min-episode-reward-to-save 400 --prefix "ppo_best"
+```
+
+### Spawn noise blocks only near cart
+```bash
+python cartpole_with_noise.py --mode record --policy random --spawn-y-band-half 2.0 --max-blocks 20 --steps 500
 ```
 
 ## Command-Line Arguments
